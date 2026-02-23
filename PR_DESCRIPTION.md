@@ -1,7 +1,4 @@
 # TITLE
-
-**Branch:** `initial-changes` → `develop`
-
 ---
 
 ## What
