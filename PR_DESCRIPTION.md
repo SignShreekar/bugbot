@@ -1,4 +1,4 @@
-# PR: BugBot — UX Improvements, Crash Recovery & Duplicate Detection
+# TITLE
 
 **Branch:** `initial-changes` → `develop`
 
