@@ -1,10 +1,34 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const { App } = require('@slack/bolt');
 const { handleBugReport, handleRepoSelection } = require('./listener');
 const { handleApproval } = require('./approval');
 
 // In-memory approval state keyed by DM channel ID
 const pendingApprovals = new Map();
+
+// File-based logger
+const LOG_DIR = path.join(__dirname, '..', 'logs');
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+const LOG_FILE = path.join(LOG_DIR, 'bugbot.log');
+
+function log(level, message) {
+  const entry = `[${new Date().toISOString()}] [${level}] ${message}`;
+  console.log(entry);
+  fs.appendFileSync(LOG_FILE, entry + '\n');
+}
+
+// Crash recovery — log and restart the process on fatal errors
+process.on('uncaughtException', (err) => {
+  log('FATAL', `Uncaught exception: ${err.message}\n${err.stack}`);
+  log('INFO', 'Restarting process in 3 seconds...');
+  setTimeout(() => process.exit(1), 3000);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log('ERROR', `Unhandled promise rejection: ${reason instanceof Error ? reason.stack : reason}`);
+});
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -43,5 +67,6 @@ app.message(async ({ message, client }) => {
 
 (async () => {
   await app.start();
-  console.log('⚡ BugBot is running in Socket Mode');
+  log('INFO', '⚡ BugBot is running in Socket Mode');
+  log('INFO', `Logs writing to: ${LOG_FILE}`);
 })();
