@@ -1,8 +1,20 @@
 const { triageBug } = require('./triage');
-const { discoverRepo, getRepoList, extractRepoFromText } = require('./repoDiscovery');
+const { discoverRepo, getAvailableRepos, extractRepoFromText } = require('./repoDiscovery');
 const { scanCode } = require('./codeScan');
 
 const MAX_CLARIFICATION_TURNS = 3;
+
+// Tracks completed analyses keyed by normalized bug text
+const analyzedBugs = new Map();
+
+function normalizeBugText(text) {
+  return text
+    .replace(/<@[A-Z0-9]+>/g, '')
+    .replace(/[^a-zA-Z0-9\s]/g, ' ')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
 
 /**
  * Phase 1 — triggered when a bug is mentioned in a channel.
@@ -16,22 +28,45 @@ async function handleBugReport({ message, client, pendingApprovals }) {
   const dmChannelId = channel.id;
   const text = message.text || '';
 
-  const repoList = getRepoList();
+  // Duplicate detection — resume if this bug was already analyzed
+  const normalizedText = normalizeBugText(text);
+  const previousAnalysis = analyzedBugs.get(normalizedText);
+  if (previousAnalysis) {
+    console.log(`[listener] duplicate bug detected, resuming previous analysis`);
+    pendingApprovals.set(dmChannelId, { ...previousAnalysis, status: 'verifying' });
+    await client.chat.postMessage({
+      channel: dmChannelId,
+      text: [
+        '⚠️ This bug was already reported and analyzed.',
+        '',
+        `*Previous analysis:* ${previousAnalysis.rca}`,
+        `*Repo:* \`${previousAnalysis.repo}\` | *Priority:* ${previousAnalysis.priority}`,
+        '',
+        'Resuming from where we left off. Reply `APPROVE` to raise a PR, `REJECT <reason>` to cancel, or ask follow-up questions.',
+      ].join('\n'),
+    });
+    return;
+  }
+
+  const repos = getAvailableRepos();
+  const numberedList = repos.map((r, i) => `${i + 1}. \`${r.name}\` — ${r.desc}`).join('\n');
 
   await client.chat.postMessage({
     channel: dmChannelId,
     text: [
-      '🐛 Got your bug report. Which codebase(s) should I focus on? _(optional)_',
+      '🐛 Got your bug report. Which codebase should I focus on?',
       '',
-      repoList,
+      numberedList,
+      `${repos.length + 1}. Let me infer automatically`,
       '',
-      'Reply with a repo name, or `skip` to let me infer it automatically.',
+      'Reply with a number.',
     ].join('\n'),
   });
 
   pendingApprovals.set(dmChannelId, {
     status: 'awaiting_repo',
     originalMessage: text,
+    repoOptions: repos,
   });
 }
 
@@ -45,10 +80,19 @@ async function handleRepoSelection({ message, client, pendingApprovals }) {
   if (!pending || pending.status !== 'awaiting_repo') return;
 
   const replyText = (message.text || '').trim();
-  const isSkip = /^skip$/i.test(replyText);
+  const repos = pending.repoOptions || [];
+  const autoInferIndex = repos.length + 1;
 
-  // Try to extract a known repo name from the reply
-  const repoHint = isSkip ? null : (extractRepoFromText(replyText) || replyText);
+  let repoHint = null;
+  const num = parseInt(replyText, 10);
+  if (!isNaN(num) && num === autoInferIndex) {
+    repoHint = null; // auto-infer
+  } else if (!isNaN(num) && num >= 1 && num <= repos.length) {
+    repoHint = repos[num - 1].name;
+  } else {
+    // Fallback: try to extract repo name from free text
+    repoHint = extractRepoFromText(replyText) || (replyText.toLowerCase() === 'skip' ? null : replyText);
+  }
 
   await runAnalysis({
     originalMessage: pending.originalMessage,
@@ -67,20 +111,28 @@ async function runAnalysis({ originalMessage, repoHint, dmChannelId, client, pen
   await client.chat.postMessage({
     channel: dmChannelId,
     text: repoHint
-      ? `🔍 Scanning \`${repoHint}\` — this may take a moment...`
-      : '🔍 Inferring repo and scanning — this may take a moment...',
+      ? `🔍 Starting analysis on \`${repoHint}\`...`
+      : '🔍 Starting analysis — will infer repo automatically...',
   });
 
   try {
-    // Triage
+    // Step 1: Triage
+    await client.chat.postMessage({ channel: dmChannelId, text: '⚙️ Step 1/3: Triaging bug priority...' });
     const { priority, reasoning } = await triageBug(originalMessage);
     console.log(`[triage] ${priority}: ${reasoning}`);
+    await client.chat.postMessage({ channel: dmChannelId, text: `✅ Priority: *${priority}* — ${reasoning}` });
 
-    // Repo
+    // Step 2: Repo discovery
     let repo = repoHint;
     if (!repo) {
+      await client.chat.postMessage({ channel: dmChannelId, text: '⚙️ Step 2/3: Inferring affected repository...' });
       const discovery = await discoverRepo(originalMessage);
       repo = discovery.repo;
+      if (repo) {
+        await client.chat.postMessage({ channel: dmChannelId, text: `✅ Identified repo: \`${repo}\` (${discovery.confidence} confidence)` });
+      }
+    } else {
+      await client.chat.postMessage({ channel: dmChannelId, text: `⚙️ Step 2/3: Using repo \`${repo}\`...` });
     }
 
     if (!repo) {
@@ -92,7 +144,8 @@ async function runAnalysis({ originalMessage, repoHint, dmChannelId, client, pen
       return;
     }
 
-    // Code scan
+    // Step 3: Code scan
+    await client.chat.postMessage({ channel: dmChannelId, text: `⚙️ Step 3/3: Scanning \`${repo}\` and building RCA...` });
     const scanResult = await scanCode(repo, originalMessage);
 
     if (!scanResult.bugExists) {
@@ -144,7 +197,7 @@ async function runAnalysis({ originalMessage, repoHint, dmChannelId, client, pen
       `Risk: ${scanResult.risk}`,
     ].join('\n');
 
-    pendingApprovals.set(dmChannelId, {
+    const analysisState = {
       status: 'verifying',
       priority,
       repo,
@@ -156,7 +209,12 @@ async function runAnalysis({ originalMessage, repoHint, dmChannelId, client, pen
       originalMessage,
       clarificationTurns: 0,
       conversationHistory: [{ role: 'assistant', content: analysisText }],
-    });
+    };
+
+    // Store analysis for duplicate detection
+    analyzedBugs.set(normalizeBugText(originalMessage), analysisState);
+
+    pendingApprovals.set(dmChannelId, analysisState);
   } catch (err) {
     console.error('[listener] error:', err);
     await client.chat.postMessage({
